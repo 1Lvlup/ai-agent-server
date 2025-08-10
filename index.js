@@ -39,6 +39,20 @@ app.post('/fake-book', async (req, res) => {
   const result = await sendBooking(payload);
   res.json({ ok: true, forwarded_to_zapier: result });
 });
+// ALSO allow a simple GET to test easily in the browser:
+app.get('/fake-book', async (req, res) => {
+  const payload = {
+    name: 'Test Customer',
+    phone: '+17010000000',
+    address: '123 Main St, Fargo, ND',
+    job: 'AC tune-up',
+    start: '2025-08-12T10:00:00-05:00',
+    end:   '2025-08-12T12:00:00-05:00',
+    notes: 'gate code 1234'
+  };
+  const result = await sendBooking(payload);
+  res.send(`Triggered booking → ${JSON.stringify(result)}`);
+});
 
 // ---- Twilio Voice webhook: returns TwiML to start streaming ----
 app.post('/voice', (req, res) => {
