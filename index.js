@@ -195,9 +195,5 @@ wss.on('connection', (twilioWs) => {
   twilioWs.on('error', (e) => console.error('Twilio WS error:', e));
 });
 
-  ws.on('close', () => console.log('>> Media Stream closed'));
-  ws.on('error', (e) => console.error('WS error', e));
-});
-
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Server listening on :${PORT}`));
