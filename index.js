@@ -140,7 +140,7 @@ wss.on('connection', (twilioWs) => {
       aiWs.send(JSON.stringify({
         type: 'response.create',
         response: {
-          modalities: ['audio'],
+        modalities: ['audio', 'text'],
           instructions: 'Thanks for calling. May I have your name and the service address?'
         }
       }));
