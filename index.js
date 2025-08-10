@@ -121,7 +121,7 @@ wss.on('connection', (twilioWs) => {
   aiWs.on('open', () => {
     console.log('>> Connected to OpenAI Realtime');
 
-    // Configure the session: match Twilio audio codec to avoid transcoding.
+    // Configure the session
     aiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
@@ -129,45 +129,41 @@ wss.on('connection', (twilioWs) => {
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         voice: VOICE,
-        modalities: ['text', 'audio'],
+        modalities: ['audio', 'text'],
         instructions: SYSTEM_MESSAGE,
         temperature: 0.6
       }
     }));
 
-    // Small delay so session settings apply, then greet (explicit audio)
+    // Small delay so session settings apply, then greet (explicit audio + text)
     setTimeout(() => {
       aiWs.send(JSON.stringify({
         type: 'response.create',
         response: {
-        modalities: ['audio', 'text'],
+          modalities: ['audio', 'text'],
           instructions: 'Thanks for calling. May I have your name and the service address?'
         }
       }));
-    }, 250);
+    }, 200);
   });
 
-  // Forward AI audio chunks back to Twilio
+  // Forward AI audio chunks back to Twilio (with debug)
   aiWs.on('message', (data) => {
     try {
       const evt = JSON.parse(data.toString());
+      if (evt.type && evt.type !== 'rate_limits.updated') {
+        console.log('AI evt:', evt.type);
+      }
 
       if (evt.type === 'response.audio.delta' && evt.delta && streamSid) {
-        // Ensure it's a base64 string
         const base64 = Buffer.isBuffer(evt.delta)
           ? evt.delta.toString('base64')
           : (typeof evt.delta === 'string' ? evt.delta : Buffer.from(evt.delta).toString('base64'));
 
-        const toTwilio = {
-          event: 'media',
-          streamSid,
-          media: { payload: base64 } // base64 g711_ulaw audio
-        };
+        const toTwilio = { event: 'media', streamSid, media: { payload: base64 } };
         twilioWs.send(JSON.stringify(toTwilio));
+        console.log('>> sent audio chunk to Twilio (bytes b64):', base64.length);
       }
-
-      if (evt.type === 'session.updated') console.log('>> Session updated');
-      if (evt.type === 'error') console.error('AI error:', evt);
     } catch (e) {
       console.error('AI parse error:', e);
     }
@@ -196,7 +192,6 @@ wss.on('connection', (twilioWs) => {
             type: 'input_audio_buffer.append',
             audio: data.media.payload
           }));
-          // server_vad will commit/respond automatically when you pause speaking
         }
         break;
 
