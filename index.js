@@ -94,26 +94,106 @@ app.post('/voice', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-wss.on('connection', (ws) => {
+wss.on('connection', (twilioWs) => {
   console.log('>> Media Stream connected');
 
-  ws.on('message', (message) => {
-    let data;
-    try { data = JSON.parse(message.toString()); } catch { return; }
+  // Connect to OpenAI Realtime over WebSocket
+  const aiWs = new WebSocket(
+    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
+    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
+  );
 
-    // Twilio events: "start", "media", "mark", "stop"
-    if (data.event === 'start') {
-      console.log(`>> Stream started. Call SID: ${data.start.callSid}`);
-      ws.send(JSON.stringify({ event: 'mark', mark: { name: 'ready' } }));
-    }
-    if (data.event === 'media') {
-      // data.media.payload is base64 mu-law audio (8kHz) from the caller
-      // We'll forward this to the AI in the next phase.
-    }
-    if (data.event === 'stop') {
-      console.log('>> Stream stopped. Call ended.');
+  let streamSid = null;
+
+  aiWs.on('open', () => {
+    console.log('>> Connected to OpenAI Realtime');
+
+    // Configure the session: match Twilio audio codec to avoid transcoding.
+    aiWs.send(JSON.stringify({
+      type: 'session.update',
+      session: {
+        turn_detection: { type: 'server_vad' },   // model detects when caller stops talking
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
+        voice: VOICE || 'alloy',
+        modalities: ['text', 'audio'],
+        instructions: SYSTEM_MESSAGE,
+        temperature: 0.5
+      }
+    }));
+
+    // Send a short greeting so you immediately hear the AI
+    aiWs.send(JSON.stringify({
+      type: 'response.create',
+      response: { instructions: 'Thanks for calling. May I have your name and the address for service?' }
+    }));
+  });
+
+  // Forward AI audio chunks back to Twilio
+  aiWs.on('message', (data) => {
+    try {
+      const evt = JSON.parse(data.toString());
+
+      if (evt.type === 'response.audio.delta' && evt.delta && streamSid) {
+        const toTwilio = {
+          event: 'media',
+          streamSid,
+          media: { payload: evt.delta } // base64 g711_ulaw audio
+        };
+        twilioWs.send(JSON.stringify(toTwilio));
+      }
+
+      // (Optional) you can log other events for debugging:
+      if (evt.type === 'error') console.error('AI error:', evt);
+      if (evt.type === 'session.updated') console.log('>> Session updated');
+    } catch (e) {
+      console.error('AI parse error:', e);
     }
   });
+
+  aiWs.on('error', (e) => console.error('AI WS error:', e));
+  aiWs.on('close', () => console.log('>> OpenAI socket closed'));
+
+  // Handle incoming Twilio media stream (caller audio)
+  twilioWs.on('message', (msg) => {
+    let data;
+    try { data = JSON.parse(msg.toString()); } catch { return; }
+
+    switch (data.event) {
+      case 'start':
+        streamSid = data.start.streamSid || data.start.callSid;
+        console.log('>> Stream started. SID:', streamSid);
+        break;
+
+      case 'media':
+        // Forward caller audio (base64 g711_ulaw) to OpenAI
+        if (aiWs.readyState === WebSocket.OPEN && data.media?.payload) {
+          aiWs.send(JSON.stringify({
+            type: 'input_audio_buffer.append',
+            audio: data.media.payload
+          }));
+          // With server_vad ON, the model will detect end-of-speech
+          // and handle committing/creating responses.
+        }
+        break;
+
+      case 'stop':
+        console.log('>> Stream stopped');
+        try { aiWs.close(); } catch {}
+        break;
+
+      default:
+        break;
+    }
+  });
+
+  twilioWs.on('close', () => {
+    console.log('>> Media Stream closed');
+    try { aiWs.close(); } catch {}
+  });
+
+  twilioWs.on('error', (e) => console.error('Twilio WS error:', e));
+});
 
   ws.on('close', () => console.log('>> Media Stream closed'));
   ws.on('error', (e) => console.error('WS error', e));
