@@ -118,7 +118,7 @@ wss.on('connection', (twilioWs) => {
         voice: VOICE || 'alloy',
         modalities: ['text', 'audio'],
         instructions: SYSTEM_MESSAGE,
-        temperature: 0.5
+        temperature: 0.6
       }
     }));
 
