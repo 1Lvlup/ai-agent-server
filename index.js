@@ -7,32 +7,27 @@ import fetch from 'node-fetch';
 // === OpenAI Realtime config ===
 const OPENAI_URL =
   'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01';
-const VOICE = 'alloy'; // change later if you want
+const VOICE = 'alloy';
 
 // --- μ-law tone helpers (beep test for Twilio playback) ---
 function linearToMuLaw(sample) {
-  const BIAS = 0x84; // 132
-  const CLIP = 32635;
-  let s = sample;
-  let sign = (s >> 8) & 0x80;
-  if (sign !== 0) s = -s;
+  const BIAS = 0x84, CLIP = 32635;
+  let s = sample, sign = (s >> 8) & 0x80;
+  if (sign) s = -s;
   if (s > CLIP) s = CLIP;
-  s = s + BIAS;
+  s += BIAS;
   let exponent = 7;
-  for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
+  for (let mask = 0x4000; (s & mask) === 0 && exponent > 0; mask >>= 1) exponent--;
   const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
-  const mu = ~(sign | (exponent << 4) | mantissa) & 0xFF;
-  return mu;
+  return ~(sign | (exponent << 4) | mantissa) & 0xFF;
 }
 function generateBeepMuLawBase64(freq = 440, ms = 300) {
-  const sampleRate = 8000;
-  const length = Math.floor(sampleRate * ms / 1000);
-  const out = new Uint8Array(length);
-  for (let i = 0; i < length; i++) {
-    const t = i / sampleRate;
-    const s = Math.sin(2 * Math.PI * freq * t);
-    const sample16 = Math.max(-1, Math.min(1, s)) * 32767;
-    out[i] = linearToMuLaw(sample16 | 0);
+  const sr = 8000, n = Math.floor(sr * ms / 1000);
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const s = Math.sin(2 * Math.PI * freq * (i / sr));
+    const int16 = Math.max(-1, Math.min(1, s)) * 32767 | 0;
+    out[i] = linearToMuLaw(int16);
   }
   return Buffer.from(out).toString('base64');
 }
@@ -42,74 +37,44 @@ const SYSTEM_MESSAGE = `
 You are a professional HVAC receptionist for {BusinessName} in {City, State}.
 Tone: warm, concise, confident. Goal: answer calls 24/7, capture job details, and book an appointment.
 
-ALWAYS collect in this order:
-1) Caller full name
-2) Mobile number (confirm with them)
-3) Full service address incl. city & zip
-4) Problem summary (no cooling, odd noise, leak, thermostat, breaker)
-5) System details (brand, approx age)
-6) Urgency (no cooling/heat, water present, gas smell = emergency)
-7) Preferred 2-hour time window
-
-If gas smell/smoke/active water leak: mark EMERGENCY and escalate to owner SMS.
-Never quote exact prices; say the tech will diagnose and give a clear estimate.
-Be brief; confirm details back to the caller. When details are complete, say they'll get a text confirmation and the tech will call en route.
+ALWAYS collect: name, mobile, full address, problem summary, system brand/age, urgency, preferred 2-hour window.
+No quotes. If emergency, escalate. Confirm details and say they’ll get a text confirmation.
 `;
 
 const app = express();
 app.use(express.json());
 
 // Health check
-app.get('/', (req, res) => res.send('OK: server is running'));
+app.get('/', (_req, res) => res.send('OK: server is running'));
 
-// ---- Booking helper (Zapier hook – optional for later) ----
+// ---- Booking helper (Zapier hook – optional) ----
 async function sendBooking(payload) {
   const url = process.env.ZAPIER_HOOK_URL;
-  if (!url) {
-    console.log('No ZAPIER_HOOK_URL set; skipping.');
-    return { ok: false, reason: 'missing Zap URL' };
-  }
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
+  if (!url) { console.log('No ZAPIER_HOOK_URL set; skipping.'); return { ok: false, reason: 'missing Zap URL' }; }
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
   return { ok: r.ok, status: r.status };
 }
 
-// Quick test endpoint to simulate a booking without AI (POST)
 app.post('/fake-book', async (req, res) => {
   const payload = Object.keys(req.body || {}).length ? req.body : {
-    name: 'Test Customer',
-    phone: '+17010000000',
-    address: '123 Main St, Fargo, ND',
+    name: 'Test Customer', phone: '+17010000000', address: '123 Main St, Fargo, ND',
     job: 'AC not cooling; unit freezing',
-    start: '2025-08-12T14:00:00-05:00',
-    end:   '2025-08-12T16:00:00-05:00',
-    notes: 'Prefer technician calls on arrival'
+    start: '2025-08-12T14:00:00-05:00', end: '2025-08-12T16:00:00-05:00', notes: 'Prefer technician calls on arrival'
   };
   const result = await sendBooking(payload);
   res.json({ ok: true, forwarded_to_zapier: result });
 });
 
-// Quick test endpoint (GET) so you can just click a link to trigger booking
-app.get('/fake-book', async (req, res) => {
-  const payload = {
-    name: 'Test Customer',
-    phone: '+17010000000',
-    address: '123 Main St, Fargo, ND',
-    job: 'AC tune-up',
-    start: '2025-08-12T10:00:00-05:00',
-    end:   '2025-08-12T12:00:00-05:00',
-    notes: 'gate code 1234'
-  };
+app.get('/fake-book', async (_req, res) => {
+  const payload = { name: 'Test Customer', phone: '+17010000000', address: '123 Main St, Fargo, ND',
+    job: 'AC tune-up', start: '2025-08-12T10:00:00-05:00', end: '2025-08-12T12:00:00-05:00', notes: 'gate code 1234' };
   const result = await sendBooking(payload);
   res.send(`Triggered booking → ${JSON.stringify(result)}`);
 });
 
-// Twilio Voice webhook: returns TwiML to start streaming
+// Twilio Voice webhook: start a **bidirectional** stream
 app.post('/voice', (req, res) => {
-  const host = req.get('host'); // e.g., your-app.onrender.com
+  const host = req.get('host');
   const wssUrl = `wss://${host}/ws`;
   const twiml =
     `<Response>
@@ -127,10 +92,23 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', (twilioWs) => {
   console.log('>> Media Stream connected');
 
+  // Log all messages FROM Twilio so we can verify bidi & streamSid
+  twilioWs.on('message', (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+      if (data.event === 'connected') console.log('Twilio evt:', data.event, data.protocol, data.version);
+      if (data.event === 'start')      console.log('Twilio evt:start tracks=', data.start?.tracks, 'streamSid=', data.streamSid);
+      if (data.event === 'media' && data.media?.track) console.log('Twilio evt:media track=', data.media.track, 'chunk=', data.media.chunk);
+      if (data.event === 'mark')       console.log('Twilio evt:mark name=', data.mark?.name);
+
+      // We handle stream start/media/stop below in a second handler
+    } catch {}
+  });
+
   console.log('>> Attempting OpenAI Realtime connection…');
   console.log('>> OPENAI key present:', !!process.env.OPENAI_API_KEY);
 
-  // Connect to OpenAI Realtime over WebSocket
+  // Connect to OpenAI Realtime
   const aiWs = new WebSocket(
     OPENAI_URL,
     { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
@@ -138,22 +116,18 @@ wss.on('connection', (twilioWs) => {
 
   let streamSid = null;
 
-  // If OpenAI rejects the WebSocket upgrade, this event fires with the HTTP response
-  aiWs.on('unexpected-response', (req, res) => {
+  aiWs.on('unexpected-response', (_req, res) => {
     console.error('!! OpenAI unexpected response status:', res.statusCode);
-    try {
-      res.on('data', (chunk) => console.error('!! OpenAI response body:', chunk.toString()));
-    } catch {}
+    try { res.on('data', (c) => console.error('!! OpenAI response body:', c.toString())); } catch {}
   });
 
   aiWs.on('open', () => {
     console.log('>> Connected to OpenAI Realtime');
 
-    // Configure the session: match Twilio audio codec to avoid transcoding.
     aiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
-        turn_detection: { type: 'server_vad' },   // model detects when caller stops talking
+        turn_detection: { type: 'server_vad' },
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         modalities: ['audio', 'text'],
@@ -163,7 +137,7 @@ wss.on('connection', (twilioWs) => {
       }
     }));
 
-    // Small delay so session settings apply, then greet (explicit audio + text)
+    // greet (explicit audio + text)
     setTimeout(() => {
       aiWs.send(JSON.stringify({
         type: 'response.create',
@@ -177,52 +151,29 @@ wss.on('connection', (twilioWs) => {
     }, 200);
   });
 
-  // Forward AI audio chunks back to Twilio (handle both event names + flush marks)
+  // Forward AI audio chunks back to Twilio; trigger replies after each utterance
   aiWs.on('message', (data) => {
     try {
       const evt = JSON.parse(data.toString());
       const type = evt.type;
 
-      // Light debug (prints most events except streaming audio frames)
       if (!['response.audio.delta','response.output_audio.delta','rate_limits.updated'].includes(type)) {
         console.log('AI evt:', type);
       }
 
-      // When OpenAI says your utterance is finished, ask it to speak a reply
       if (type === 'input_audio_buffer.committed') {
         aiWs.send(JSON.stringify({
           type: 'response.create',
-          response: {
-            modalities: ['audio', 'text'],
-            voice: VOICE,
-            output_audio_format: 'g711_ulaw'
-          }
+          response: { modalities: ['audio', 'text'], voice: VOICE, output_audio_format: 'g711_ulaw' }
         }));
       }
 
-      // Stream audio chunks back to Twilio (handle both event names)
-      if ((type === 'response.audio.delta' || type === 'response.output_audio.delta')
-          && evt.delta && streamSid) {
-
-        const base64 = typeof evt.delta === 'string'
-          ? evt.delta
-          : Buffer.from(evt.delta).toString('base64');
-
-        twilioWs.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: base64 }
-        }));
-
-        // Optional: ask Twilio to confirm it drained the buffer
-        twilioWs.send(JSON.stringify({
-          event: 'mark',
-          streamSid,
-          mark: { name: `m-${Date.now()}` }
-        }));
-
-        // Debug so we *see* audio frames arriving
-        console.log('>> sent audio chunk to Twilio (bytes b64):', base64.length);
+      if ((type === 'response.audio.delta' || type === 'response.output_audio.delta') && evt.delta && streamSid) {
+        const base64 = typeof evt.delta === 'string' ? evt.delta : Buffer.from(evt.delta).toString('base64');
+        // IMPORTANT: include `track: "outbound"` per Twilio docs for clarity on direction
+        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64, track: 'outbound' } }));
+        twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `ai-${Date.now()}` } }));
+        console.log('>> sent AI audio chunk to Twilio (b64 len):', base64.length);
       }
     } catch (e) {
       console.error('AI parse error:', e);
@@ -230,59 +181,43 @@ wss.on('connection', (twilioWs) => {
   });
 
   aiWs.on('error', (e) => console.error('AI WS error:', e));
-  aiWs.on('close', (code, reason) => {
-    console.log('>> OpenAI socket closed', code, reason?.toString?.() || '');
-  });
+  aiWs.on('close', (code, reason) => console.log('>> OpenAI socket closed', code, reason?.toString?.() || ''));
 
-  // Handle incoming Twilio media stream (caller audio)
+  // Handle incoming Twilio media stream (caller audio) + send test beep
   twilioWs.on('message', (msg) => {
-    let data;
-    try { data = JSON.parse(msg.toString()); } catch { return; }
+    let data; try { data = JSON.parse(msg.toString()); } catch { return; }
 
     switch (data.event) {
-      case 'start':
-        streamSid = data.start.streamSid || data.start.callSid;
+      case 'start': {
+        streamSid = data.start.streamSid || data.streamSid || data.start.callSid;
         console.log('>> Stream started. SID:', streamSid);
 
-        // TEST: play a short beep so we know Twilio will play audio we send
+        // Clear any buffered audio, then play a 300ms beep.
+        twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
         const beep = generateBeepMuLawBase64(440, 300);
-        twilioWs.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: beep }
-        }));
-        twilioWs.send(JSON.stringify({
-          event: 'mark',
-          streamSid,
-          mark: { name: `beep-${Date.now()}` }
-        }));
+        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: beep, track: 'outbound' } }));
+        twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `beep-${Date.now()}` } }));
         break;
+      }
 
-      case 'media':
-        // Forward caller audio (base64 g711_ulaw) to OpenAI
+      case 'media': {
         if (aiWs.readyState === WebSocket.OPEN && data.media?.payload) {
-          aiWs.send(JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: data.media.payload
-          }));
+          aiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
         }
         break;
+      }
 
-      case 'stop':
+      case 'stop': {
         console.log('>> Stream stopped');
         try { aiWs.close(); } catch {}
         break;
+      }
 
-      default:
-        break;
+      default: break;
     }
   });
 
-  twilioWs.on('close', () => {
-    console.log('>> Media Stream closed');
-    try { aiWs.close(); } catch {}
-  });
-
+  twilioWs.on('close', () => { console.log('>> Media Stream closed'); try { aiWs.close(); } catch {} });
   twilioWs.on('error', (e) => console.error('Twilio WS error:', e));
 });
 
