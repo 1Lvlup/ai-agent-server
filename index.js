@@ -150,7 +150,7 @@ wss.on('connection', (twilioWs) => {
   });
 
   // Forward AI audio chunks back to Twilio (handle both event names + flush marks)
-  aiaiWs.on('message', (data) => {
+  aiWs.on('message', (data) => {
   try {
     const evt = JSON.parse(data.toString());
     const type = evt.type;
