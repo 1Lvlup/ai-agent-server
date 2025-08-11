@@ -155,6 +155,21 @@ aiWs.on('message', (data) => {
     const evt = JSON.parse(data.toString());
     const type = evt.type;
 
+    // When OpenAI says your utterance is finished, ask it to speak a reply
+if (type === 'input_audio_buffer.committed') {
+  aiWs.send(JSON.stringify({
+    type: 'response.create',
+    response: {
+      modalities: ['audio', 'text'],
+      voice: VOICE,
+      output_audio_format: 'g711_ulaw',
+      // a tiny instruction helps some builds produce audio instead of text-only
+      instructions: 'Speak your answer out loud to the caller.'
+    }
+  }));
+}
+
+
     // Light debug
     if (!['response.audio.delta','response.output_audio.delta','rate_limits.updated'].includes(type)) {
       console.log('AI evt:', type);
