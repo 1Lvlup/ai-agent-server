@@ -7,7 +7,35 @@ import fetch from 'node-fetch';
 // === OpenAI Realtime config ===
 const OPENAI_URL =
   'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01';
-const VOICE = 'alloy'; // you can change later
+const VOICE = 'alloy'; // change later if you want
+
+// --- μ-law tone helpers (beep test for Twilio playback) ---
+function linearToMuLaw(sample) {
+  const BIAS = 0x84; // 132
+  const CLIP = 32635;
+  let s = sample;
+  let sign = (s >> 8) & 0x80;
+  if (sign !== 0) s = -s;
+  if (s > CLIP) s = CLIP;
+  s = s + BIAS;
+  let exponent = 7;
+  for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
+  const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
+  const mu = ~(sign | (exponent << 4) | mantissa) & 0xFF;
+  return mu;
+}
+function generateBeepMuLawBase64(freq = 440, ms = 300) {
+  const sampleRate = 8000;
+  const length = Math.floor(sampleRate * ms / 1000);
+  const out = new Uint8Array(length);
+  for (let i = 0; i < length; i++) {
+    const t = i / sampleRate;
+    const s = Math.sin(2 * Math.PI * freq * t);
+    const sample16 = Math.max(-1, Math.min(1, s)) * 32767;
+    out[i] = linearToMuLaw(sample16 | 0);
+  }
+  return Buffer.from(out).toString('base64');
+}
 
 // Short, focused receptionist instructions
 const SYSTEM_MESSAGE = `
@@ -150,70 +178,56 @@ wss.on('connection', (twilioWs) => {
   });
 
   // Forward AI audio chunks back to Twilio (handle both event names + flush marks)
-aiWs.on('message', (data) => {
-  try {
-    const evt = JSON.parse(data.toString());
-    const type = evt.type;
+  aiWs.on('message', (data) => {
+    try {
+      const evt = JSON.parse(data.toString());
+      const type = evt.type;
 
-    // When OpenAI says your utterance is finished, ask it to speak a reply
-if (type === 'input_audio_buffer.committed') {
-  aiWs.send(JSON.stringify({
-    type: 'response.create',
-    response: {
-      modalities: ['audio', 'text'],
-      voice: VOICE,
-      output_audio_format: 'g711_ulaw',
-      // a tiny instruction helps some builds produce audio instead of text-only
-      instructions: 'Speak your answer out loud to the caller.'
+      // Light debug (prints most events except streaming audio frames)
+      if (!['response.audio.delta','response.output_audio.delta','rate_limits.updated'].includes(type)) {
+        console.log('AI evt:', type);
+      }
+
+      // When OpenAI says your utterance is finished, ask it to speak a reply
+      if (type === 'input_audio_buffer.committed') {
+        aiWs.send(JSON.stringify({
+          type: 'response.create',
+          response: {
+            modalities: ['audio', 'text'],
+            voice: VOICE,
+            output_audio_format: 'g711_ulaw'
+          }
+        }));
+      }
+
+      // Stream audio chunks back to Twilio (handle both event names)
+      if ((type === 'response.audio.delta' || type === 'response.output_audio.delta')
+          && evt.delta && streamSid) {
+
+        const base64 = typeof evt.delta === 'string'
+          ? evt.delta
+          : Buffer.from(evt.delta).toString('base64');
+
+        twilioWs.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: { payload: base64 }
+        }));
+
+        // Optional: ask Twilio to confirm it drained the buffer
+        twilioWs.send(JSON.stringify({
+          event: 'mark',
+          streamSid,
+          mark: { name: `m-${Date.now()}` }
+        }));
+
+        // Debug so we *see* audio frames arriving
+        console.log('>> sent audio chunk to Twilio (bytes b64):', base64.length);
+      }
+    } catch (e) {
+      console.error('AI parse error:', e);
     }
-  }));
-}
-
-
-    // Light debug
-    if (!['response.audio.delta','response.output_audio.delta','rate_limits.updated'].includes(type)) {
-      console.log('AI evt:', type);
-    }
-
-    // Trigger a reply after each utterance
-    if (type === 'input_audio_buffer.committed') {
-      aiWs.send(JSON.stringify({
-        type: 'response.create',
-        response: {
-          modalities: ['audio', 'text'],
-          voice: VOICE,
-          output_audio_format: 'g711_ulaw'
-        }
-      }));
-    }
-
-    // Stream audio chunks back to Twilio (handle both event names)
-    if ((type === 'response.audio.delta' || type === 'response.output_audio.delta')
-    && evt.delta && streamSid) {
-
-  const base64 = typeof evt.delta === 'string'
-    ? evt.delta
-    : Buffer.from(evt.delta).toString('base64');
-
-  twilioWs.send(JSON.stringify({
-    event: 'media',
-    streamSid,
-    media: { payload: base64 }
-  }));
-
-  // (Optional) flush marker so Twilio drains the buffer smoothly
-  twilioWs.send(JSON.stringify({
-    event: 'mark',
-    streamSid,
-    mark: { name: `m-${Date.now()}` }
-  }));
-
-  // debug so we *see* audio frames arriving
-  console.log('>> sent audio chunk to Twilio (bytes b64):', base64.length);
-}
-
-
-
+  });
 
   aiWs.on('error', (e) => console.error('AI WS error:', e));
   aiWs.on('close', (code, reason) => {
@@ -229,6 +243,19 @@ if (type === 'input_audio_buffer.committed') {
       case 'start':
         streamSid = data.start.streamSid || data.start.callSid;
         console.log('>> Stream started. SID:', streamSid);
+
+        // TEST: play a short beep so we know Twilio will play audio we send
+        const beep = generateBeepMuLawBase64(440, 300);
+        twilioWs.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: { payload: beep }
+        }));
+        twilioWs.send(JSON.stringify({
+          event: 'mark',
+          streamSid,
+          mark: { name: `beep-${Date.now()}` }
+        }));
         break;
 
       case 'media':
