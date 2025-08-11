@@ -121,15 +121,16 @@ wss.on('connection', (twilioWs) => {
   aiWs.on('open', () => {
     console.log('>> Connected to OpenAI Realtime');
 
-    // Configure the session
+    // Configure the session: match Twilio audio codec to avoid transcoding.
     aiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         turn_detection: { type: 'server_vad' },   // model detects when caller stops talking
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
-        voice: VOICE,
         modalities: ['audio', 'text'],
+        voice: VOICE,
+        input_audio_transcription: { model: 'whisper-1' },
         instructions: SYSTEM_MESSAGE,
         temperature: 0.6
       }
@@ -141,28 +142,42 @@ wss.on('connection', (twilioWs) => {
         type: 'response.create',
         response: {
           modalities: ['audio', 'text'],
-          instructions: 'Thanks for calling. May I have your name and the service address?'
+          voice: VOICE,
+          output_audio_format: 'g711_ulaw',
+          instructions: 'Hello! I am the HVAC receptionist bot. I can hear you. What’s your name?'
         }
       }));
     }, 200);
   });
 
-  // Forward AI audio chunks back to Twilio (with debug)
+  // Forward AI audio chunks back to Twilio (handle both event names + flush marks)
   aiWs.on('message', (data) => {
     try {
       const evt = JSON.parse(data.toString());
-      if (evt.type && evt.type !== 'rate_limits.updated') {
-        console.log('AI evt:', evt.type);
+      const type = evt.type;
+      if (!['response.audio.delta','response.output_audio.delta','rate_limits.updated'].includes(type)) {
+        console.log('AI evt:', type);
       }
 
-      if (evt.type === 'response.audio.delta' && evt.delta && streamSid) {
-        const base64 = Buffer.isBuffer(evt.delta)
-          ? evt.delta.toString('base64')
-          : (typeof evt.delta === 'string' ? evt.delta : Buffer.from(evt.delta).toString('base64'));
+      if ((type === 'response.audio.delta' || type === 'response.output_audio.delta')
+          && evt.delta && streamSid) {
+        const base64 = typeof evt.delta === 'string'
+          ? evt.delta
+          : Buffer.from(evt.delta).toString('base64');
 
-        const toTwilio = { event: 'media', streamSid, media: { payload: base64 } };
-        twilioWs.send(JSON.stringify(toTwilio));
-        console.log('>> sent audio chunk to Twilio (bytes b64):', base64.length);
+        // Send audio frame
+        twilioWs.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: { payload: base64 }
+        }));
+
+        // Ask Twilio to confirm it drained buffered audio
+        twilioWs.send(JSON.stringify({
+          event: 'mark',
+          streamSid,
+          mark: { name: `m-${Date.now()}` }
+        }));
       }
     } catch (e) {
       console.error('AI parse error:', e);
