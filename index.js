@@ -150,19 +150,18 @@ wss.on('connection', (twilioWs) => {
   });
 
   // Forward AI audio chunks back to Twilio (handle both event names + flush marks)
-  aiWs.on('message', (data) => {
+aiWs.on('message', (data) => {
   try {
     const evt = JSON.parse(data.toString());
     const type = evt.type;
 
-    // Light debug (keep)
+    // Light debug
     if (!['response.audio.delta','response.output_audio.delta','rate_limits.updated'].includes(type)) {
       console.log('AI evt:', type);
     }
 
-    // 1) When the model says your utterance is finished, ask it to respond
+    // Trigger a reply after each utterance
     if (type === 'input_audio_buffer.committed') {
-      // Explicitly create a response with audio every time you finish talking
       aiWs.send(JSON.stringify({
         type: 'response.create',
         response: {
@@ -173,7 +172,7 @@ wss.on('connection', (twilioWs) => {
       }));
     }
 
-    // 2) Stream audio chunks back to Twilio (handle both event names)
+    // Stream audio chunks back to Twilio (handle both event names)
     if ((type === 'response.audio.delta' || type === 'response.output_audio.delta')
         && evt.delta && streamSid) {
 
@@ -198,6 +197,7 @@ wss.on('connection', (twilioWs) => {
     console.error('AI parse error:', e);
   }
 });
+
 
 
   aiWs.on('error', (e) => console.error('AI WS error:', e));
