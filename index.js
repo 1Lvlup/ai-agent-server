@@ -175,7 +175,7 @@ if (type === 'response.created' || type === 'response.done') {
     response: {
       modalities: ['audio', 'text'],
       voice: VOICE,
-      output_audio_format: 'g711_ulaw',
+      output_audio_format: 'pcm16',
       instructions: 'Speak your answer out loud to the caller.'
     }
   }));
