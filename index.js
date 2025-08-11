@@ -4,11 +4,11 @@ import http from 'http';
 import WebSocket, { WebSocketServer } from 'ws';
 import fetch from 'node-fetch';
 
-// ========= BASIC SETTINGS (single client) =========
+// ===== BASIC CONFIG (single client) =====
 const OPENAI_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01';
 const VOICE = process.env.VOICE || 'alloy';
 
-// ---- μ-law helpers (beep so you know outbound audio works) ----
+// (Optional) tiny μ-law beep so you can hear outbound audio right after connect
 function linearToMuLaw(sample) {
   const BIAS = 0x84, CLIP = 32635;
   let s = sample, sign = (s >> 8) & 0x80;
@@ -31,18 +31,18 @@ function generateBeepMuLawBase64(freq = 440, ms = 250) {
   return Buffer.from(out).toString('base64');
 }
 
-// ---- what the bot says/does ----
+// Prompt/instructions
 const SYSTEM_MESSAGE = `
 You are a professional HVAC receptionist for ${process.env.BUSINESS_NAME || 'Our HVAC'} in ${process.env.BUSINESS_CITY || 'our service area'}.
-Tone: warm, concise, confident. Your mission: collect details and book an appointment.
+Tone: warm, concise, confident. Collect details and book an appointment.
 
 ALWAYS collect, one item at a time:
 1) Full name
-2) Mobile number (repeat back to confirm)
+2) Mobile number (confirm back)
 3) Full service address (street, city, ZIP)
 4) Problem summary (no cooling/heat, noise, leak, thermostat, breaker)
 5) System brand and approx. age
-6) Urgency (no cooling/heat, water present, gas smell = EMERGENCY)
+6) Urgency (no cooling/heat, water, or gas smell = EMERGENCY)
 7) Preferred 2-hour time window
 
 Stay on-topic. If caller drifts: “Happy to help—first, may I get your full name?”
@@ -56,28 +56,31 @@ BOOKING:{"name":"...","phone":"...","address":"...","job":"...","start":"YYYY-MM
 const app = express();
 app.use(express.json());
 
-// health
+// Health check
 app.get('/', (_req, res) => res.send('OK: server is running'));
 
-// ---- optional: send booking to Zapier (set ZAPIER_HOOK_URL in Render) ----
+// (Optional) send booking to Zapier
 async function sendBooking(payload) {
   const url = process.env.ZAPIER_HOOK_URL;
   if (!url) { console.log('No ZAPIER_HOOK_URL set; skipping.'); return { ok: false, reason: 'missing Zap URL' }; }
-  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  const r = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+  });
   return { ok: r.ok, status: r.status };
 }
 
-// quick test (GET in browser) to push a fake booking to Zap
+// Quick manual test in your browser (fires a fake booking to Zap)
 app.get('/fake-book', async (_req, res) => {
   const payload = {
     name: 'Test Customer', phone: '+17010000000', address: '123 Main St, Fargo, ND',
-    job: 'AC tune-up', start: '2025-08-12T10:00:00-05:00', end: '2025-08-12T12:00:00-05:00', notes: 'gate code 1234', emergency: false
+    job: 'AC tune-up', start: '2025-08-12T10:00:00-05:00', end: '2025-08-12T12:00:00-05:00',
+    notes: 'gate code 1234', emergency: false
   };
   const result = await sendBooking(payload);
   res.send(`Triggered booking → ${JSON.stringify(result)}`);
 });
 
-// Twilio voice webhook: **one URL only** (/voice)
+// Twilio webhook (single URL): /voice
 app.post('/voice', (req, res) => {
   const host = req.get('host');
   const wssUrl = `wss://${host}/ws`;
@@ -90,14 +93,14 @@ app.post('/voice', (req, res) => {
   res.send(twiml);
 });
 
-// ===== Twilio <-> OpenAI bridge over WebSocket =====
+// ===== Twilio <-> OpenAI Realtime bridge =====
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (twilioWs) => {
   console.log('>> Media Stream connected');
 
-  // light Twilio debug
+  // Minimal Twilio debug
   twilioWs.on('message', (m) => {
     try {
       const d = JSON.parse(m.toString());
@@ -107,7 +110,6 @@ wss.on('connection', (twilioWs) => {
     } catch {}
   });
 
-  // connect to OpenAI Realtime
   console.log('>> Attempting OpenAI Realtime connection… key present:', !!process.env.OPENAI_API_KEY);
   const aiWs = new WebSocket(
     OPENAI_URL,
@@ -115,28 +117,19 @@ wss.on('connection', (twilioWs) => {
   );
 
   let streamSid = null;
-  let aiBusy = false;
-  let pendingPrompt = null;
+  let aiBusy = false;  // prevents “conversation_already_has_active_response”
   let lastTextChunk = '';
-
-  const REPLY_SHAPE = { modalities: ['audio', 'text'], voice: VOICE, output_audio_format: 'pcm16' };
-
-  const sendReply = (textOrNull) => {
-    aiWs.send(JSON.stringify({
-      type: 'response.create',
-      response: textOrNull ? { ...REPLY_SHAPE, instructions: textOrNull } : { ...REPLY_SHAPE }
-    }));
-  };
 
   aiWs.on('open', () => {
     console.log('>> Connected to OpenAI Realtime');
 
+    // Configure session for μ-law passthrough both ways
     aiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         turn_detection: { type: 'server_vad' },
-        input_audio_format: 'g711_ulaw',   // Twilio sends G.711 μ-law
-        output_audio_format: 'pcm16',      // OpenAI returns 24k PCM16
+        input_audio_format: 'g711_ulaw',   // Twilio -> OpenAI
+        output_audio_format: 'g711_ulaw',  // OpenAI -> Twilio (no resample)
         modalities: ['audio', 'text'],
         voice: VOICE,
         instructions: SYSTEM_MESSAGE,
@@ -144,9 +137,17 @@ wss.on('connection', (twilioWs) => {
       }
     }));
 
+    // Greet
     setTimeout(() => {
-      const greet = `Thanks for calling ${process.env.BUSINESS_NAME || 'our service'}. May I have your full name?`;
-      if (!aiBusy) sendReply(greet); else pendingPrompt = greet;
+      aiWs.send(JSON.stringify({
+        type: 'response.create',
+        response: {
+          modalities: ['audio', 'text'],
+          voice: VOICE,
+          output_audio_format: 'g711_ulaw',
+          instructions: `Thanks for calling ${process.env.BUSINESS_NAME || 'our service'}. May I have your full name?`
+        }
+      }));
     }, 200);
   });
 
@@ -168,8 +169,7 @@ wss.on('connection', (twilioWs) => {
 
       if (type === 'response.done') {
         aiBusy = false;
-
-        // parse BOOKING JSON if present
+        // Look for BOOKING: JSON line
         const m = lastTextChunk.match(/BOOKING:\s*(\{.*\})/);
         if (m) {
           try {
@@ -179,29 +179,25 @@ wss.on('connection', (twilioWs) => {
           } catch (e) { console.error('!! BOOKING JSON parse failed:', e); }
         }
         lastTextChunk = '';
-
-        if (pendingPrompt) { const txt = pendingPrompt; pendingPrompt = null; sendReply(txt); }
       }
 
-      // after caller stops talking, ask model to respond
-      if (type === 'input_audio_buffer.committed') {
-        if (!aiBusy) sendReply(null);
-      }
-
-      // Stream audio back to Twilio: PCM16 24k -> μ-law 8k
+      // Send audio to Twilio (OpenAI → Twilio), μ-law passthrough
       if ((type === 'response.audio.delta' || type === 'response.output_audio.delta') && evt.delta && streamSid) {
-        const pcm24k = Buffer.from(
-          typeof evt.delta === 'string' ? evt.delta : Buffer.from(evt.delta).toString('base64'),
-          'base64'
-        );
-        const samples = new Int16Array(pcm24k.buffer, pcm24k.byteOffset, pcm24k.length / 2);
-        const outLen = Math.floor(samples.length / 3); // naive downsample 24k -> 8k
-        const ulaw = new Uint8Array(outLen);
-        for (let i = 0, j = 0; j < outLen; i += 3, j++) ulaw[j] = linearToMuLaw(samples[i]);
-        const ulawB64 = Buffer.from(ulaw).toString('base64');
-        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: ulawB64 } }));
-        twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `ai-${Date.now()}` } }));
-        // console.log('>> sent AI audio chunk (μ-law) len:', ulawB64.length);
+        const base64 = typeof evt.delta === 'string'
+          ? evt.delta
+          : Buffer.from(evt.delta).toString('base64');
+        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64 } }));
+        // console.log('>> sent AI audio chunk to Twilio (μ-law) len:', base64.length);
+      }
+
+      // When caller stops talking, ask model to reply (one at a time)
+      if (type === 'input_audio_buffer.committed') {
+        if (!aiBusy) {
+          aiWs.send(JSON.stringify({
+            type: 'response.create',
+            response: { modalities: ['audio', 'text'], voice: VOICE, output_audio_format: 'g711_ulaw' }
+          }));
+        }
       }
     } catch (e) {
       console.error('AI parse error:', e);
@@ -217,13 +213,13 @@ wss.on('connection', (twilioWs) => {
 
     switch (data.event) {
       case 'start': {
-        const sid = data.start?.streamSid || data.streamSid || data.start?.callSid;
-        console.log('>> Stream started. SID:', sid);
-        // short beep to prove outbound works
-        twilioWs.send(JSON.stringify({ event: 'clear', streamSid: sid }));
-        const beep = generateBeepMuLawBase64(440, 250);
-        twilioWs.send(JSON.stringify({ event: 'media', streamSid: sid, media: { payload: beep } }));
-        twilioWs.send(JSON.stringify({ event: 'mark', streamSid: sid, mark: { name: `beep-${Date.now()}` } }));
+        streamSid = data.start?.streamSid || data.streamSid || data.start?.callSid;
+        console.log('>> Stream started. SID:', streamSid);
+        // optional: prove outbound with a quick beep
+        try {
+          const beep = generateBeepMuLawBase64(440, 220);
+          twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: beep } }));
+        } catch {}
         break;
       }
       case 'media': {
@@ -233,7 +229,8 @@ wss.on('connection', (twilioWs) => {
         break;
       }
       case 'stop': {
-        console.log('>> Stream stopped'); try { aiWs.close(); } catch {}
+        console.log('>> Stream stopped');
+        try { aiWs.close(); } catch {}
         break;
       }
       default: break;
