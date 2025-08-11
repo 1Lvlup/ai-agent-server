@@ -130,7 +130,6 @@ wss.on('connection', (twilioWs) => {
         output_audio_format: 'g711_ulaw',
         modalities: ['audio', 'text'],
         voice: VOICE,
-        input_audio_transcription: { model: 'whisper-1' },
         instructions: SYSTEM_MESSAGE,
         temperature: 0.6
       }
