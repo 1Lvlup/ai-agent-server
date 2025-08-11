@@ -20,7 +20,7 @@ function linearToMuLaw(sample) {
   const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
   return ~(sign | (exponent << 4) | mantissa) & 0xFF;
 }
-function generateBeepMuLawBase64(freq = 440, ms = 300) {
+function generateBeepMuLawBase64(freq = 440, ms = 250) {
   const sr = 8000, n = Math.floor(sr * ms / 1000);
   const out = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
@@ -39,6 +39,13 @@ Always collect: name, mobile, full address, problem summary, system brand/age, u
 No quotes. If emergency, escalate. Confirm details and say they’ll get a text confirmation.
 `;
 
+// For consistent response payloads
+const REPLY_SHAPE = {
+  modalities: ['audio', 'text'],
+  voice: VOICE,
+  output_audio_format: 'pcm16'
+};
+
 const app = express();
 app.use(express.json());
 
@@ -56,185 +63,4 @@ app.post('/fake-book', async (req, res) => {
   const payload = Object.keys(req.body || {}).length ? req.body : {
     name: 'Test Customer', phone: '+17010000000', address: '123 Main St, Fargo, ND',
     job: 'AC not cooling; unit freezing',
-    start: '2025-08-12T14:00:00-05:00', end: '2025-08-12T16:00:00-05:00', notes: 'Prefer technician calls on arrival'
-  };
-  const result = await sendBooking(payload);
-  res.json({ ok: true, forwarded_to_zapier: result });
-});
-app.get('/fake-book', async (_req, res) => {
-  const payload = { name: 'Test Customer', phone: '+17010000000', address: '123 Main St, Fargo, ND',
-    job: 'AC tune-up', start: '2025-08-12T10:00:00-05:00', end: '2025-08-12T12:00:00-05:00', notes: 'gate code 1234' };
-  const result = await sendBooking(payload);
-  res.send(`Triggered booking → ${JSON.stringify(result)}`);
-});
-
-// ---- Twilio Voice webhook: start stream ----
-app.post('/voice', (req, res) => {
-  const host = req.get('host');
-  const wssUrl = `wss://${host}/ws`;
-  const twiml =
-    `<Response>
-       <Say>Connecting your call. One moment.</Say>
-       <Connect><Stream url="${wssUrl}"/></Connect>
-     </Response>`;
-  res.set('Content-Type', 'text/xml');
-  res.send(twiml);
-});
-
-// ================== WebSocket server ==================
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
-
-wss.on('connection', (twilioWs) => {
-  console.log('>> Media Stream connected');
-
-  // Light Twilio debug
-  twilioWs.on('message', (msg) => {
-    try {
-      const data = JSON.parse(msg.toString());
-      if (data.event === 'connected') console.log('Twilio evt:', data.event, data.protocol, data.version);
-      if (data.event === 'start')      console.log('Twilio evt:start tracks=', data.start?.tracks, 'streamSid=', data.streamSid);
-      if (data.event === 'media' && data.media?.track) console.log('Twilio evt:media track=', data.media.track, 'chunk=', data.media.chunk);
-      if (data.event === 'mark')       console.log('Twilio evt:mark name=', data.mark?.name);
-    } catch {}
-  });
-
-  console.log('>> Attempting OpenAI Realtime connection…');
-  console.log('>> OPENAI key present:', !!process.env.OPENAI_API_KEY);
-
-  const aiWs = new WebSocket(
-    OPENAI_URL,
-    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
-  );
-
-  let streamSid = null;
-
-  aiWs.on('unexpected-response', (_req, res) => {
-    console.error('!! OpenAI unexpected response status:', res.statusCode);
-    try { res.on('data', (c) => console.error('!! OpenAI response body:', c.toString())); } catch {}
-  });
-
-  aiWs.on('open', () => {
-    console.log('>> Connected to OpenAI Realtime');
-
-    // Session: Twilio -> OpenAI is g711_ulaw; OpenAI -> us is PCM16 (24k)
-    aiWs.send(JSON.stringify({
-      type: 'session.update',
-      session: {
-        turn_detection: { type: 'server_vad' },
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'pcm16',
-        modalities: ['audio', 'text'],
-        voice: VOICE,
-        instructions: SYSTEM_MESSAGE,
-        temperature: 0.6
-      }
-    }));
-
-    // Greet (force audio)
-    setTimeout(() => {
-      aiWs.send(JSON.stringify({
-        type: 'response.create',
-        response: {
-          modalities: ['audio', 'text'],
-          voice: VOICE,
-          output_audio_format: 'pcm16',
-          instructions: 'Hello! I am the HVAC receptionist bot. I can hear you. What’s your name?'
-        }
-      }));
-    }, 200);
-  });
-
-  // OpenAI -> us events
-  aiWs.on('message', (data) => {
-    try {
-      const evt = JSON.parse(data.toString());
-      const type = evt.type;
-
-      if (!['response.audio.delta','response.output_audio.delta','rate_limits.updated'].includes(type)) {
-        console.log('AI evt:', type);
-      }
-      if (type === 'error') {
-        console.error('AI error detail:', JSON.stringify(evt, null, 2));
-      }
-      if (type === 'response.created' || type === 'response.done') {
-        console.log('AI response envelope:', JSON.stringify(evt, null, 2));
-      }
-
-      // After each utterance, request a spoken reply
-      if (type === 'input_audio_buffer.committed') {
-        aiWs.send(JSON.stringify({
-          type: 'response.create',
-          response: {
-            modalities: ['audio', 'text'],
-            voice: VOICE,
-            output_audio_format: 'pcm16',
-            instructions: 'Speak your answer out loud to the caller.'
-          }
-        }));
-      }
-
-      // Stream audio back to Twilio (PCM16 24k -> 8k μ-law)
-      if ((type === 'response.audio.delta' || type === 'response.output_audio.delta') && evt.delta && streamSid) {
-        // evt.delta is base64 PCM16 little-endian, 24kHz mono
-        const pcm24k = Buffer.from(
-          typeof evt.delta === 'string' ? evt.delta : Buffer.from(evt.delta).toString('base64'),
-          'base64'
-        );
-        const samples = new Int16Array(pcm24k.buffer, pcm24k.byteOffset, pcm24k.length / 2);
-        const outLen = Math.floor(samples.length / 3); // 24k -> 8k (take every 3rd sample)
-        const ulaw = new Uint8Array(outLen);
-        for (let i = 0, j = 0; j < outLen; i += 3, j++) {
-          ulaw[j] = linearToMuLaw(samples[i]);
-        }
-        const ulawB64 = Buffer.from(ulaw).toString('base64');
-
-        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: ulawB64 } }));
-        twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `ai-${Date.now()}` } }));
-        console.log('>> sent AI audio chunk to Twilio (μ-law, 8k) len:', ulawB64.length);
-      }
-    } catch (e) {
-      console.error('AI parse error:', e);
-    }
-  });
-
-  aiWs.on('error', (e) => console.error('AI WS error:', e));
-  aiWs.on('close', (code, reason) => console.log('>> OpenAI socket closed', code, reason?.toString?.() || ''));
-
-  // Twilio -> us (caller audio)
-  twilioWs.on('message', (msg) => {
-    let data; try { data = JSON.parse(msg.toString()); } catch { return; }
-
-    switch (data.event) {
-      case 'start': {
-        streamSid = data.start?.streamSid || data.streamSid || data.start?.callSid;
-        console.log('>> Stream started. SID:', streamSid);
-
-        // Clear any buffered audio, then play a quick beep to prove playback
-        twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
-        const beep = generateBeepMuLawBase64(440, 250);
-        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: beep } }));
-        twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `beep-${Date.now()}` } }));
-        break;
-      }
-      case 'media': {
-        if (aiWs.readyState === WebSocket.OPEN && data.media?.payload) {
-          aiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
-        }
-        break;
-      }
-      case 'stop': {
-        console.log('>> Stream stopped');
-        try { aiWs.close(); } catch {}
-        break;
-      }
-      default: break;
-    }
-  });
-
-  twilioWs.on('close', () => { console.log('>> Media Stream closed'); try { aiWs.close(); } catch {} });
-  twilioWs.on('error', (e) => console.error('Twilio WS error:', e));
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server listening on :${PORT}`));
+    start: '2025-08-12T14:00:00-05:00', e
