@@ -157,16 +157,29 @@ wss.on('connection', (twilioWs) => {
       const evt = JSON.parse(data.toString());
       const type = evt.type;
 
+      if (type === 'error') {
+  console.error('AI error detail:', JSON.stringify(evt, null, 2));
+}
+
       if (!['response.audio.delta','response.output_audio.delta','rate_limits.updated'].includes(type)) {
         console.log('AI evt:', type);
       }
 
-      if (type === 'input_audio_buffer.committed') {
-        aiWs.send(JSON.stringify({
-          type: 'response.create',
-          response: { modalities: ['audio', 'text'], voice: VOICE, output_audio_format: 'g711_ulaw' }
-        }));
-      }
+if (type === 'response.created' || type === 'response.done') {
+  console.log('AI response envelope:', JSON.stringify(evt, null, 2));
+}
+      
+    if (type === 'input_audio_buffer.committed') {
+  aiWs.send(JSON.stringify({
+    type: 'response.create',
+    response: {
+      modalities: ['audio', 'text'],
+      voice: VOICE,
+      output_audio_format: 'g711_ulaw',
+      instructions: 'Speak your answer out loud to the caller.'
+    }
+  }));
+}
 
       if ((type === 'response.audio.delta' || type === 'response.output_audio.delta') && evt.delta && streamSid) {
         const base64 = typeof evt.delta === 'string' ? evt.delta : Buffer.from(evt.delta).toString('base64');
