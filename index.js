@@ -189,29 +189,29 @@ if (type === 'input_audio_buffer.committed') {
 
     // Stream audio chunks back to Twilio (handle both event names)
     if ((type === 'response.audio.delta' || type === 'response.output_audio.delta')
-        && evt.delta && streamSid) {
+    && evt.delta && streamSid) {
 
-      const base64 = typeof evt.delta === 'string'
-        ? evt.delta
-        : Buffer.from(evt.delta).toString('base64');
+  const base64 = typeof evt.delta === 'string'
+    ? evt.delta
+    : Buffer.from(evt.delta).toString('base64');
 
-      twilioWs.send(JSON.stringify({
-        event: 'media',
-        streamSid,
-        media: { payload: base64 }
-      }));
+  twilioWs.send(JSON.stringify({
+    event: 'media',
+    streamSid,
+    media: { payload: base64 }
+  }));
 
-      // Optional: ask Twilio to confirm it drained buffered audio
-      twilioWs.send(JSON.stringify({
-        event: 'mark',
-        streamSid,
-        mark: { name: `m-${Date.now()}` }
-      }));
-    }
-  } catch (e) {
-    console.error('AI parse error:', e);
-  }
-});
+  // (Optional) flush marker so Twilio drains the buffer smoothly
+  twilioWs.send(JSON.stringify({
+    event: 'mark',
+    streamSid,
+    mark: { name: `m-${Date.now()}` }
+  }));
+
+  // debug so we *see* audio frames arriving
+  console.log('>> sent audio chunk to Twilio (bytes b64):', base64.length);
+}
+
 
 
 
