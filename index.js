@@ -1,11 +1,15 @@
+// index.js
 import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import WebSocket, { WebSocketServer } from 'ws';
 import fetch from 'node-fetch';
 
-// ============== Config you can change (=Render Env Vars) ==============
-const OPENAI_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01';
+// ================= Config (env overrides) =================
+const OPENAI_URL =
+  process.env.OPENAI_URL ||
+  'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01';
+
 const VOICE = process.env.VOICE || 'alloy';
 const BUSINESS_NAME = process.env.BUSINESS_NAME || '{BusinessName}';
 const BUSINESS_CITY = process.env.BUSINESS_CITY || '{City, State}';
@@ -33,7 +37,7 @@ function generateBeepMuLawBase64(freq = 440, ms = 250) {
   return Buffer.from(out).toString('base64');
 }
 
-// ============== System prompt (edit tone/flow here) ==============
+// ================= System prompt (tone/flow) =================
 const SYSTEM_MESSAGE = `
 You are a professional HVAC receptionist for ${BUSINESS_NAME} in ${BUSINESS_CITY}.
 Tone: warm, concise, confident. Goal: collect job details and book an appointment.
@@ -54,14 +58,27 @@ Rules to stay on-topic:
 - Confirm key details back to the caller succinctly.
 - When an emergency keyword (gas smell, smoke, active water leak) is heard: mark EMERGENCY and collect address + callback immediately.
 
+Address collection protocol:
+- Collect in THREE steps: (a) Street & number (b) City (c) ZIP.
+- Ask for numbers digit by digit. Example: “What’s the ZIP? Please say each digit.”
+- After you capture each part, repeat back EXACTLY and ask a quick yes/no confirm.
+- If uncertain or caller speaks fast, ask to SPELL: “Please spell the street name slowly.”
+- Do not move to the next field until the current one is confirmed “yes.”
+
+Turn-taking:
+- Wait a brief beat after the caller stops. If you interrupt, immediately say “Sorry—go ahead,” and stay quiet until they finish.
+
+Speaking style:
+- Speak in short sentences, moderate pace, and brief pauses between fields.
+
 When you have all required fields, in addition to speaking, emit ONE single line of text:
 BOOKING:{"name":"...","phone":"...","address":"...","job":"...","start":"YYYY-MM-DDTHH:mm:ssZZ","end":"YYYY-MM-DDTHH:mm:ssZZ","notes":"...","emergency":true|false}
 Notes:
 - Keep JSON on one line, minified, exactly after "BOOKING:" with no extra text.
-- times are local to caller; if unsure, propose a 2-hour window and include it.
+- Times are local to caller; if unsure, propose a 2-hour window and include it.
 `;
 
-// We always ask for audio + text; audio goes to caller, text lets us catch BOOKING:
+// We want audio to caller + text to us (for BOOKING capture)
 const REPLY_SHAPE = { modalities: ['audio', 'text'], voice: VOICE, output_audio_format: 'pcm16' };
 
 const app = express();
@@ -70,7 +87,7 @@ app.use(express.json());
 // Health check
 app.get('/', (_req, res) => res.send('OK: server is running'));
 
-// --------- Zapier booking helper (already works with your hook) ----------
+// --------- Zapier booking helper ----------
 async function sendBooking(payload) {
   const url = process.env.ZAPIER_HOOK_URL;
   if (!url) { console.log('No ZAPIER_HOOK_URL set; skipping.'); return { ok: false, reason: 'missing Zap URL' }; }
@@ -78,7 +95,7 @@ async function sendBooking(payload) {
   return { ok: r.ok, status: r.status };
 }
 
-// Test endpoints (unchanged)
+// Test endpoints
 app.post('/fake-book', async (req, res) => {
   const payload = Object.keys(req.body || {}).length ? req.body : {
     name: 'Test Customer', phone: '+17010000000', address: '123 Main St, Fargo, ND',
@@ -95,13 +112,13 @@ app.get('/fake-book', async (_req, res) => {
   res.send(`Triggered booking → ${JSON.stringify(result)}`);
 });
 
-// --------- Twilio Voice webhook: bidirectional stream ----------
+// --------- Twilio Voice webhook (bidirectional stream) ----------
 app.post('/voice', (req, res) => {
   const host = req.get('host');
   const wssUrl = `wss://${host}/ws`;
   const twiml =
     `<Response>
-       <Say>Connecting your call. One moment.</Say>
+       <Say voice="Polly.Joanna">Connecting your call. One moment.</Say>
        <Connect><Stream url="${wssUrl}"/></Connect>
      </Response>`;
   res.set('Content-Type', 'text/xml');
@@ -136,10 +153,12 @@ wss.on('connection', (twilioWs) => {
 
   let streamSid = null;
   let aiBusy = false;           // prevent overlapping responses
-  let pendingPrompt = null;     // one queued prompt
-  let lastTextChunk = '';       // we accumulate text for BOOKING: JSON
+  let pendingPrompt = null;     // optional queued prompt (rarely needed now)
+  let lastTextChunk = '';       // accumulate text for BOOKING: JSON
 
   const sendReply = (textOrNull) => {
+    if (aiBusy) return; // don't stack responses
+    aiBusy = true;
     aiWs.send(JSON.stringify({
       type: 'response.create',
       response: textOrNull ? { ...REPLY_SHAPE, instructions: textOrNull } : { ...REPLY_SHAPE }
@@ -158,8 +177,8 @@ wss.on('connection', (twilioWs) => {
       type: 'session.update',
       session: {
         turn_detection: { type: 'server_vad' },
-        input_audio_format: 'g711_ulaw',   // from Twilio
-        output_audio_format: 'pcm16',      // high quality out, we downsample
+        input_audio_format: 'g711_ulaw',   // Twilio inbound
+        output_audio_format: 'pcm16',      // high quality out, we downsample to μ-law 8k
         modalities: ['audio', 'text'],
         voice: VOICE,
         instructions: SYSTEM_MESSAGE,
@@ -167,10 +186,10 @@ wss.on('connection', (twilioWs) => {
       }
     }));
 
-    // Greet
+    // Greet (slight delay so session settings apply)
     setTimeout(() => {
       const greet = `Thanks for calling ${BUSINESS_NAME}. I can help get you scheduled. May I have your full name?`;
-      if (!aiBusy) sendReply(greet); else pendingPrompt = greet;
+      sendReply(greet);
     }, 200);
   });
 
@@ -189,11 +208,13 @@ wss.on('connection', (twilioWs) => {
       }
 
       if (type === 'response.created') {
-        aiBusy = true;
+        aiBusy = true; // model is speaking or will speak
       }
+
       if (type === 'response.output_text.delta' && typeof evt.delta === 'string') {
         lastTextChunk += evt.delta;
       }
+
       if (type === 'response.done') {
         aiBusy = false;
 
@@ -210,26 +231,28 @@ wss.on('connection', (twilioWs) => {
         }
         lastTextChunk = '';
 
-        // Send any queued prompt
+        // Send queued prompt (rare with gating, but keep for safety)
         if (pendingPrompt) {
           const txt = pendingPrompt; pendingPrompt = null;
           sendReply(txt);
         }
       }
 
-      // After caller stops speaking, ask model to respond (if not already speaking)
+      // After caller stops speaking, ask model to respond (with a short debounce)
       if (type === 'input_audio_buffer.committed') {
-        if (!aiBusy) sendReply(null); else pendingPrompt = null;
+        setTimeout(() => {
+          if (!aiBusy) sendReply(null);
+        }, 150);
       }
 
-      // Stream audio back to Twilio: PCM16 (24k) -> μ-law 8k
+      // Stream audio back to Twilio: PCM16 (24k) -> μ-law 8k (naive downsample 3:1)
       if ((type === 'response.audio.delta' || type === 'response.output_audio.delta') && evt.delta && streamSid) {
         const pcm24k = Buffer.from(
           typeof evt.delta === 'string' ? evt.delta : Buffer.from(evt.delta).toString('base64'),
           'base64'
         );
         const samples = new Int16Array(pcm24k.buffer, pcm24k.byteOffset, pcm24k.length / 2);
-        const outLen = Math.floor(samples.length / 3); // 24k -> 8k naive downsample
+        const outLen = Math.floor(samples.length / 3); // 24k -> 8k
         const ulaw = new Uint8Array(outLen);
         for (let i = 0, j = 0; j < outLen; i += 3, j++) {
           ulaw[j] = linearToMuLaw(samples[i]);
@@ -237,7 +260,7 @@ wss.on('connection', (twilioWs) => {
         const ulawB64 = Buffer.from(ulaw).toString('base64');
         twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: ulawB64 } }));
         twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `ai-${Date.now()}` } }));
-        console.log('>> sent AI audio chunk to Twilio (μ-law, 8k) len:', ulawB64.length);
+        // console.log('>> sent AI audio chunk to Twilio (μ-law, 8k) len:', ulawB64.length);
       }
 
     } catch (e) {
@@ -263,17 +286,21 @@ wss.on('connection', (twilioWs) => {
         twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `beep-${Date.now()}` } }));
         break;
       }
+
       case 'media': {
-        if (aiWs.readyState === WebSocket.OPEN && data.media?.payload) {
+        // Half-duplex gating: if AI is speaking, drop inbound audio
+        if (!aiBusy && aiWs.readyState === WebSocket.OPEN && data.media?.payload) {
           aiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
         }
         break;
       }
+
       case 'stop': {
         console.log('>> Stream stopped');
         try { aiWs.close(); } catch {}
         break;
       }
+
       default: break;
     }
   });
