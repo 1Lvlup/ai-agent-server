@@ -128,8 +128,8 @@ wss.on('connection', (twilioWs) => {
       type: 'session.update',
       session: {
         turn_detection: { type: 'server_vad' },
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
+        input_audio_format: 'g711_ulaw',   // Twilio → OpenAI remains μ-law
+output_audio_format: 'pcm16',      // OpenAI → us is now 24k PCM16
         modalities: ['audio', 'text'],
         voice: VOICE,
         instructions: SYSTEM_MESSAGE,
@@ -144,7 +144,7 @@ wss.on('connection', (twilioWs) => {
         response: {
           modalities: ['audio', 'text'],
           voice: VOICE,
-          output_audio_format: 'g711_ulaw',
+          output_audio_format: 'pcm16',
           instructions: 'Hello! I am the HVAC receptionist bot. I can hear you. What’s your name?'
         }
       }));
@@ -182,16 +182,39 @@ if (type === 'response.created' || type === 'response.done') {
 }
 
       if ((type === 'response.audio.delta' || type === 'response.output_audio.delta') && evt.delta && streamSid) {
-        const base64 = typeof evt.delta === 'string' ? evt.delta : Buffer.from(evt.delta).toString('base64');
-        // IMPORTANT: include `track: "outbound"` per Twilio docs for clarity on direction
-        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64, track: 'outbound' } }));
-        twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `ai-${Date.now()}` } }));
-        console.log('>> sent AI audio chunk to Twilio (b64 len):', base64.length);
-      }
-    } catch (e) {
-      console.error('AI parse error:', e);
-    }
-  });
+        // evt.delta is base64 PCM16 at 24kHz (mono, little-endian)
+const pcm24k = Buffer.from(
+  typeof evt.delta === 'string' ? evt.delta : Buffer.from(evt.delta).toString('base64'),
+  'base64'
+);
+
+// Downsample 24k → 8k by simple decimation (take every 3rd sample)
+// Then μ-law encode for Twilio
+const samples = new Int16Array(pcm24k.buffer, pcm24k.byteOffset, pcm24k.length / 2);
+const outLen = Math.floor(samples.length / 3);
+const ulaw = new Uint8Array(outLen);
+for (let i = 0, j = 0; j < outLen; i += 3, j++) {
+  const s = samples[i]; // take every 3rd sample
+  // μ-law encode (reuse your linearToMuLaw helper)
+  ulaw[j] = linearToMuLaw(s);
+}
+const ulawB64 = Buffer.from(ulaw).toString('base64');
+
+// Send to Twilio
+twilioWs.send(JSON.stringify({
+  event: 'media',
+  streamSid,
+  media: { payload: ulawB64 }
+}));
+console.log('>> sent AI audio chunk to Twilio (μ-law, 8k) len:', ulawB64.length);
+
+// Optional: flush marker
+twilioWs.send(JSON.stringify({
+  event: 'mark',
+  streamSid,
+  mark: { name: `ai-${Date.now()}` }
+}));
+
 
   aiWs.on('error', (e) => console.error('AI WS error:', e));
   aiWs.on('close', (code, reason) => console.log('>> OpenAI socket closed', code, reason?.toString?.() || ''));
