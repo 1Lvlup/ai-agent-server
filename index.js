@@ -69,7 +69,7 @@ Turn-taking:
 - Wait a brief beat after the caller stops. If you interrupt, immediately say “Sorry—go ahead,” and stay quiet until they finish.
 
 Speaking style:
-- Speak in short sentences, moderate pace, and brief pauses between fields.
+- Speak in short sentences, moderate pace (~140 wpm), and brief pauses between fields.
 
 When you have all required fields, in addition to speaking, emit ONE single line of text:
 BOOKING:{"name":"...","phone":"...","address":"...","job":"...","start":"YYYY-MM-DDTHH:mm:ssZZ","end":"YYYY-MM-DDTHH:mm:ssZZ","notes":"...","emergency":true|false}
@@ -80,6 +80,42 @@ Notes:
 
 // We want audio to caller + text to us (for BOOKING capture)
 const REPLY_SHAPE = { modalities: ['audio', 'text'], voice: VOICE, output_audio_format: 'pcm16' };
+
+// ---- Booking validators & follow-ups ----
+const DIGITS = /[^\d]/g;
+const cleanPhone = (p='') => p.replace(DIGITS, '');
+const hasText = (s) => typeof s === 'string' && s.trim().length > 4;
+const isLikelyPhone = (p) => {
+  const d = cleanPhone(p);
+  return d.length >= 10 && d.length <= 11;
+};
+const isZip = (z='') => /^\d{5}$/.test(z.trim());
+function missingBookingFields(b = {}) {
+  const miss = [];
+  if (!hasText(b.name)) miss.push('name');
+  if (!isLikelyPhone(b.phone)) miss.push('phone');
+  if (!hasText(b.address)) miss.push('address');
+  if (!hasText(b.job)) miss.push('job');
+  // time window can be optional in some workflows, keep it required for now:
+  if (!hasText(b.start) || !hasText(b.end)) miss.push('time_window');
+  return miss;
+}
+function followupFor(field) {
+  switch (field) {
+    case 'name':
+      return 'I still need your full name. Please spell your first and last name.';
+    case 'phone':
+      return 'What is the best callback number? Please say each digit slowly.';
+    case 'address':
+      return 'Let’s confirm the service address. First the street and number, then the city, then the ZIP.';
+    case 'job':
+      return 'Briefly, what seems to be the problem with your system?';
+    case 'time_window':
+      return 'What two-hour window works best today or tomorrow? For example, ten to twelve, or two to four.';
+    default:
+      return 'Thanks—one more detail, please.';
+  }
+}
 
 const app = express();
 app.use(express.json());
@@ -216,19 +252,50 @@ wss.on('connection', (twilioWs) => {
       }
 
       if (type === 'response.done') {
-        aiBusy = false;
+  aiBusy = false;
 
-        // Parse any BOOKING:{...} JSON the model emitted in text
-        const m = lastTextChunk.match(/BOOKING:\s*(\{.*\})/);
-        if (m) {
-          try {
-            const booking = JSON.parse(m[1]);
-            console.log('>> Detected BOOKING JSON:', booking);
-            sendBooking(booking).then(r => console.log('>> Sent to Zapier:', r));
-          } catch (e) {
-            console.error('!! Failed to parse BOOKING JSON:', e);
-          }
+  // Look for a BOOKING JSON line in the model's text stream
+  const m = lastTextChunk.match(/BOOKING:\s*(\{.*\})/);
+  if (m) {
+    try {
+      const booking = JSON.parse(m[1]);
+      console.log('>> Detected BOOKING JSON:', booking);
+
+      // Decide what's missing (if anything)
+      const miss = missingBookingFields(booking);
+      if (miss.length) {
+        const ask = followupFor(miss[0]);
+        // queue a targeted follow-up question
+        // (will be sent right after this response finishes)
+        pendingPrompt = ask;
+      } else {
+        // Everything looks good → send to Zapier
+        sendBooking(booking).then(r => console.log('>> Sent to Zapier:', r));
+
+        // Friendly wrap up (different line if emergency)
+        if (booking.emergency === true) {
+          pendingPrompt =
+            'I have everything I need and I\'m flagging this as an emergency. The on-call tech will reach out right away. Is there anything else before I wrap up?';
+        } else {
+          pendingPrompt =
+            'Perfect. I have everything I need. You\'ll get a text confirmation shortly and the technician will call when en route. Anything else I can help with?';
         }
+      }
+    } catch (e) {
+      console.error('!! Failed to parse BOOKING JSON:', e);
+      // If parsing failed, gently ask the model to re-emit
+      pendingPrompt = 'Sorry—I didn’t catch that. Please repeat that last detail.';
+    }
+  }
+
+  // Clear text buffer and send any queued prompt
+  lastTextChunk = '';
+  if (pendingPrompt) {
+    const txt = pendingPrompt; pendingPrompt = null;
+    if (!aiBusy) sendReply(txt);
+  }
+}
+
         lastTextChunk = '';
 
         // Send queued prompt (rare with gating, but keep for safety)
@@ -242,7 +309,7 @@ wss.on('connection', (twilioWs) => {
       if (type === 'input_audio_buffer.committed') {
         setTimeout(() => {
           if (!aiBusy) sendReply(null);
-        }, 150);
+        }, 400);
       }
 
       // Stream audio back to Twilio: PCM16 (24k) -> μ-law 8k (naive downsample 3:1)
